@@ -1,0 +1,389 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Low-cost PostgreSQL on ECS Fargate Spot with EFS storage and sidecar backups to S3
+
+Parameters:
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for ECS tasks and EFS mount targets (min 1)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the subnets
+  DBPasswordSSMParam:
+    Type: String
+    Description: Name or ARN of an SSM SecureString parameter containing the PostgreSQL password
+  BackupIntervalHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    Description: Hours between backups (default 24)
+  BackupRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days to retain backups in S3 before deletion (default 30)
+  NumberOfSubnets:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 2, 3]
+    Description: Number of subnets provided (for EFS mount targets)
+  TaskCpu:
+    Type: String
+    Default: '512'
+    AllowedValues: ['256', '512', '1024', '2048', '4096']
+    Description: CPU units for the ECS task (default 512 = 0.5 vCPU)
+  TaskMemory:
+    Type: String
+    Default: '1024'
+    AllowedValues: ['512', '1024', '2048', '3072', '4096', '5120', '6144', '7168', '8192', '16384', '30720']
+    Description: Memory in MiB for the ECS task (default 1024 = 1 GB)
+
+Conditions:
+  Has2ndSubnet: !Not [!Equals [!Ref NumberOfSubnets, 1]]
+  Has3rdSubnet: !Equals [!Ref NumberOfSubnets, 3]
+
+Resources:
+  # --- Security Groups ---
+  ClientSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Attach to resources that need PostgreSQL access
+      VpcId: !Ref VpcId
+
+  DatabaseSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL ECS task security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ClientSG
+          Description: PostgreSQL from clients
+
+  EfsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS mount target security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref DatabaseSG
+          Description: NFS from ECS task
+
+  # --- EFS ---
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+
+  AccessPointData:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: '999'
+        Gid: '999'
+      RootDirectory:
+        Path: /data
+        CreationInfo:
+          OwnerUid: '999'
+          OwnerGid: '999'
+          Permissions: '755'
+
+  AccessPointBackups:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: '999'
+        Gid: '999'
+      RootDirectory:
+        Path: /backups
+        CreationInfo:
+          OwnerUid: '999'
+          OwnerGid: '999'
+          Permissions: '755'
+
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSG]
+
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Condition: Has2ndSubnet
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSG]
+
+  MountTarget3:
+    Type: AWS::EFS::MountTarget
+    Condition: Has3rdSubnet
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [2, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSG]
+
+  # --- ECS ---
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub ${AWS::StackName}.local
+      Vpc: !Ref VpcId
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders:
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      ServiceConnectDefaults:
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SSMGetParameters
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BackupToS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${BackupBucket.Arn}/*
+
+  PostgreSQLTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: frugal-postgresql
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      Volumes:
+        - Name: pg-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref AccessPointData
+              IAM: DISABLED
+        - Name: pg-backups
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref AccessPointBackups
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: postgresql
+          Image: postgres:16
+          Essential: true
+          Command:
+            - -c
+            - archive_mode=on
+            - -c
+            - archive_command=mkdir -p /backups/wal && test ! -f /backups/wal/%f && cp %p /backups/wal/%f
+          PortMappings:
+            - ContainerPort: 5432
+              Name: postgresql
+          MountPoints:
+            - SourceVolume: pg-data
+              ContainerPath: /var/lib/postgresql/data
+            - SourceVolume: pg-backups
+              ContainerPath: /backups
+          Environment:
+            - Name: PGDATA
+              Value: /var/lib/postgresql/data/pgdata
+          Secrets:
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Ref DBPasswordSSMParam
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: postgresql
+        - Name: backup
+          Image: postgres:16
+          Essential: false
+          MountPoints:
+            - SourceVolume: pg-backups
+              ContainerPath: /backups
+          Secrets:
+            - Name: PGPASSWORD
+              ValueFrom: !Ref DBPasswordSSMParam
+          Environment:
+            - Name: S3_BUCKET
+              Value: !Ref BackupBucket
+            - Name: BACKUP_INTERVAL_HOURS
+              Value: !Ref BackupIntervalHours
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          EntryPoint: ["/bin/bash", "-c"]
+          Command:
+            - !Sub |
+                apt-get update -qq && apt-get install -y -qq awscli > /dev/null 2>&1
+                echo "Waiting for PostgreSQL..."
+                until pg_isready -h 127.0.0.1 -U postgres > /dev/null 2>&1; do sleep 5; done
+                echo "PostgreSQL ready."
+                # Background: upload WAL files every 60s
+                while true; do
+                  for WAL in /backups/wal/*; do
+                    [ -f "$WAL" ] || continue
+                    aws s3 cp "$WAL" "s3://$S3_BUCKET/wal/$(basename $WAL)" --quiet && rm -f "$WAL"
+                  done
+                  sleep 60
+                done &
+                echo "Starting backup loop (every ${BackupIntervalHours}h)."
+                while true; do
+                  PREFIX=$(date -u +%Y/%m/%d/%H%M%S)
+                  DATABASES=$(psql -h 127.0.0.1 -U postgres -t -A -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname != 'postgres'")
+                  for DB in postgres $DATABASES; do
+                    FILE="/backups/${!DB}.dump"
+                    pg_dump -h 127.0.0.1 -U postgres --format=custom "$DB" > "$FILE"
+                    aws s3 cp "$FILE" "s3://$S3_BUCKET/$PREFIX/${!DB}.dump" --quiet
+                    rm -f "$FILE"
+                    echo "Backed up $DB to s3://$S3_BUCKET/$PREFIX/${!DB}.dump"
+                  done
+                  echo "Backup complete. Sleeping ${BackupIntervalHours}h."
+                  sleep $((BACKUP_INTERVAL_HOURS * 3600))
+                done
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backup
+
+  ServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: postgresql-dns
+      NamespaceId: !GetAtt ServiceDiscoveryNamespace.Id
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 15
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  PostgreSQLService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - MountTarget1
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      AvailabilityZoneRebalancing: DISABLED
+      PlatformVersion: LATEST
+      TaskDefinition: !Ref PostgreSQLTaskDefinition
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      EnableExecuteCommand: true
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ServiceDiscoveryService.Arn
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+        Services:
+          - PortName: postgresql
+            DiscoveryName: postgresql-sc
+            ClientAliases:
+              - Port: 5432
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref DatabaseSG
+
+  # --- CloudWatch ---
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/frugal-postgresql-${AWS::StackName}
+      RetentionInDays: 14
+
+  # --- S3 Backup Bucket ---
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireBackups
+            Status: Enabled
+            ExpirationInDays: !Ref BackupRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+Outputs:
+  ClusterName:
+    Value: !Ref EcsCluster
+  ServiceName:
+    Value: !GetAtt PostgreSQLService.Name
+  DatabaseEndpoint:
+    Value: !Sub postgresql-dns.${AWS::StackName}.local
+    Description: DNS name for the PostgreSQL instance (port 5432) — resolvable from anywhere in the VPC
+  DatabaseSecurityGroupId:
+    Value: !Ref DatabaseSG
+    Description: Security group for the PostgreSQL task
+  ClientSecurityGroupId:
+    Value: !Ref ClientSG
+    Description: Attach this SG to resources that need DB access
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  FileSystemId:
+    Value: !Ref FileSystem
